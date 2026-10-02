@@ -1,0 +1,36 @@
+# Секреты передаются контейнеру через Compose env_file
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Локальные зависимости, VCS и инструменты
+.git
+.idea
+.vscode
+.venv
+venv
+env
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+
+# Артефакты и локальные данные
+**/dist
+**/build
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.log
+**/.DS_Store
+**/.coverage*
+**/htmlcov
+**/coverage
+**/staticfiles
+**/media
+
+# Backend-образу не нужны frontend и личные планы
+frontend
+plans

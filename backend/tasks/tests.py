@@ -1,3 +1,8 @@
-from django.test import TestCase
+from django.urls import reverse
 
-# Create your tests here.
+
+def test_health_check(client):
+    response = client.get(reverse("tasks:health_check"))
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
