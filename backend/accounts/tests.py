@@ -112,7 +112,6 @@ def test_me_returns_current_user(django_user_model):
         "email": "user@example.com",
     }
 
-
 def test_get_csrf(django_user_model):
     client = APIClient()
     response = client.get('/api/v1/auth/csrf/')
@@ -125,3 +124,99 @@ def test_get_csrf(django_user_model):
 
     assert "csrftoken" in response.cookies
     assert response.cookies["csrftoken"].value != ""
+
+@pytest.mark.django_db
+def test_register(django_user_model):
+    client = APIClient(enforce_csrf_checks=True)
+    csrf_response = client.get('/api/v1/auth/csrf/')
+    assert csrf_response.status_code == 200
+    token = csrf_response.json()['csrfToken']
+    password = 'Violet!River-72-Copper'
+    payload = {
+        'email': ' NewUser@EXAMPLE.COM ',
+        'username': 'user',
+        'password': password,
+        'password_confirm': password,
+    }
+    count_before = django_user_model.objects.count()
+
+    response = client.post(
+        '/api/v1/auth/register/', payload, format='json',
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert response.status_code == 201, response.content
+    assert django_user_model.objects.count() == count_before + 1
+    user = django_user_model.objects.get(pk=response.json()['id'])
+    assert user.email == 'newuser@example.com'
+    assert user.check_password(password)
+    expected = {'id': user.pk, 'username': 'user', 'email': user.email}
+    assert response.json() == expected
+
+    # Тот же клиент уже хранит cookie сессии, созданной при регистрации.
+    me_response = client.get('/api/v1/auth/me/')
+    assert me_response.status_code == 200
+    assert me_response.json() == expected
+
+    # Вход меняет CSRF-секрет: перед следующим POST получаем свежий токен.
+    csrf_response = client.get('/api/v1/auth/csrf/')
+    assert csrf_response.status_code == 200
+    response = client.post(
+        '/api/v1/auth/register/', payload, format='json',
+        HTTP_X_CSRFTOKEN=csrf_response.json()['csrfToken'],
+    )
+    assert response.status_code == 409
+    assert django_user_model.objects.count() == count_before + 1
+    assert client.get('/api/v1/auth/me/').json() == expected
+
+@pytest.mark.django_db
+def test_register_requires_csrf(django_user_model):
+    client = APIClient(enforce_csrf_checks=True)
+    count_before = django_user_model.objects.count()
+    response = client.post('/api/v1/auth/register/', {
+        'email': 'newuser@example.com',
+        'username': 'user',
+        'password': 'Violet!River-72-Copper',
+        'password_confirm': 'Violet!River-72-Copper',
+    }, format='json')
+    assert response.status_code == 403
+    assert django_user_model.objects.count() == count_before
+
+@pytest.mark.django_db
+def test_register_rejects_mismatched_passwords(django_user_model):
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    count_before = django_user_model.objects.count()
+    response = client.post('/api/v1/auth/register/', {
+        'email': 'newuser@example.com',
+        'username': 'user',
+        'password': 'Violet!River-72-Copper',
+        'password_confirm': 'Another!River-81-Copper',
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 400
+    assert 'password_confirm' in response.json()
+    assert django_user_model.objects.count() == count_before
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('email, expected_status', [
+    ('EXISTING@example.com', 400),
+    ('another@example.com', 201),
+])
+def test_register_duplicate_fields(django_user_model, email, expected_status):
+    django_user_model.objects.create_user(
+        email='existing@example.com', username='user', password='test-password',
+    )
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    count_before = django_user_model.objects.count()
+    response = client.post('/api/v1/auth/register/', {
+        'email': email,
+        'username': 'user',
+        'password': 'Violet!River-72-Copper',
+        'password_confirm': 'Violet!River-72-Copper',
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == expected_status, response.content
+    if expected_status == 400:
+        assert 'email' in response.json()
+        assert django_user_model.objects.count() == count_before
+    else:
+        assert django_user_model.objects.count() == count_before + 1
