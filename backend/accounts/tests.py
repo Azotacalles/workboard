@@ -92,7 +92,7 @@ def test_me_requires_authentication():
     response = client.get('/api/v1/auth/me/')
     assert response.status_code == 403
 
-
+@pytest.mark.django_db
 def test_me_returns_current_user(django_user_model):
     user = django_user_model.objects.create_user(
         email="user@example.com",
@@ -111,3 +111,17 @@ def test_me_returns_current_user(django_user_model):
         "username": "user",
         "email": "user@example.com",
     }
+
+
+def test_get_csrf(django_user_model):
+    client = APIClient()
+    response = client.get('/api/v1/auth/csrf/')
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "csrfToken" in data
+    assert isinstance(data["csrfToken"], str)
+    assert data["csrfToken"] != ""
+
+    assert "csrftoken" in response.cookies
+    assert response.cookies["csrftoken"].value != ""
