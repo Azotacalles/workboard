@@ -124,6 +124,7 @@ REST_FRAMEWORK = {
 # Sessions
 SESSION_COOKIE_AGE = 1209600
 SESSION_SAVE_EVERY_REQUEST = False
+CSRF_FAILURE_VIEW = 'accounts.views.csrf_failure'
 
 # Internationalization
 # https://docs.djangoproject.com/en/6.1/topics/i18n/

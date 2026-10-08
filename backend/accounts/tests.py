@@ -1,4 +1,5 @@
 import pytest
+from django.conf import settings
 from django.db import connection, IntegrityError
 from rest_framework.test import APIClient
 
@@ -122,6 +123,7 @@ def test_get_csrf(django_user_model):
 
     data = response.json()
     assert "csrfToken" in data
+    assert 'no-store' in response['Cache-Control']
     assert isinstance(data["csrfToken"], str)
     assert data["csrfToken"] != ""
 
@@ -149,6 +151,7 @@ def test_register(django_user_model):
         HTTP_X_CSRFTOKEN=token,
     )
     assert response.status_code == 201, response.content
+    assert 'no-store' in response['Cache-Control']
     assert django_user_model.objects.count() == count_before + 1
     user = django_user_model.objects.get(pk=response.json()['id'])
     assert user.email == 'newuser@example.com'
@@ -159,6 +162,7 @@ def test_register(django_user_model):
     # Тот же клиент уже хранит cookie сессии, созданной при регистрации.
     me_response = client.get('/api/v1/auth/me/')
     assert me_response.status_code == 200
+    assert 'no-store' in me_response['Cache-Control']
     assert me_response.json() == expected
 
     # Вход меняет CSRF-секрет: перед следующим POST получаем свежий токен.
@@ -169,6 +173,11 @@ def test_register(django_user_model):
         HTTP_X_CSRFTOKEN=csrf_response.json()['csrfToken'],
     )
     assert response.status_code == 409
+    assert response.json() == {
+        'code': 'already_authenticated',
+        'detail': 'Вы уже вошли в приложение.',
+    }
+    assert 'no-store' in response['Cache-Control']
     assert django_user_model.objects.count() == count_before + 1
     assert client.get('/api/v1/auth/me/').json() == expected
 
@@ -200,6 +209,7 @@ def test_register_rejects_mismatched_passwords(django_user_model):
     }, format='json', HTTP_X_CSRFTOKEN=token)
     assert response.status_code == 400
     assert 'password_confirm' in response.json()
+    assert 'no-store' in response['Cache-Control']
     assert django_user_model.objects.count() == count_before
 
 @pytest.mark.django_db
@@ -245,6 +255,7 @@ def test_user_login(django_user_model):
 
     expected = {'id': user.pk, 'email': user.email, 'username': user.username}
     assert response.status_code == 200, response.content
+    assert 'no-store' in response['Cache-Control']
     assert response.json() == expected
     response = client.get('/api/v1/auth/me/')
     assert response.status_code == 200
@@ -262,6 +273,11 @@ def test_user_login(django_user_model):
     }, format='json', HTTP_X_CSRFTOKEN=token)
     # По правилу проекта уже вошедший клиент не может переключиться через login.
     assert response.status_code == 409
+    assert response.json() == {
+        'code': 'already_authenticated',
+        'detail': 'Вы уже вошли в приложение.',
+    }
+    assert 'no-store' in response['Cache-Control']
     assert client.get('/api/v1/auth/me/').json() == expected
 
 
@@ -318,3 +334,94 @@ def test_login_validates_input(payload, field):
                            HTTP_X_CSRFTOKEN=token)
     assert response.status_code == 400
     assert field in response.json()
+
+
+@pytest.mark.django_db
+def test_user_logout(django_user_model):
+    # Настоящий вход → проверка CSRF на выходе → выход → повтор → старая cookie.
+    user = django_user_model.objects.create_user(
+        email='user@gmail.com',
+        username='user',
+        password='passASD123!',
+    )
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/login/', {
+        'email': 'user@gmail.com',
+        'password': 'passASD123!',
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 200
+
+    expected = {'id': user.id, 'email': user.email, 'username': user.username}
+    assert client.get('/api/v1/auth/me/').json() == expected
+
+    old_session = client.cookies[settings.SESSION_COOKIE_NAME].value
+
+    # Без токена выход отклоняется, а действующая сессия сохраняется.
+    response = client.post('/api/v1/auth/logout/')
+    assert response.status_code == 403
+    assert response.json() == {
+        'code': 'csrf_failed',
+        'detail': 'Не удалось проверить запрос. Обновите страницу.',
+    }
+    assert 'no-store' in response['Cache-Control']
+    assert client.get('/api/v1/auth/me/').json() == expected
+
+    # GET не выполняет выход.
+    assert client.get('/api/v1/auth/logout/').status_code == 405
+    assert client.get('/api/v1/auth/me/').json() == expected
+
+    # После login нужен свежий токен; cookie клиент отправляет автоматически.
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/logout/', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 204
+    assert response.content == b''
+    assert 'no-store' in response['Cache-Control']
+
+    response = client.get('/api/v1/auth/me/')
+    assert response.status_code == 403
+    assert response.json() == {
+        'code': 'not_authenticated',
+        'detail': 'Необходим вход в приложение.',
+    }
+    assert 'no-store' in response['Cache-Control']
+
+    # Повторный logout разрешён анонимному клиенту с корректным CSRF.
+    response = client.post('/api/v1/auth/logout/', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 204
+    assert response.content == ''
+
+    # Возврат старой cookie не восстанавливает удалённую серверную сессию.
+    other_client = APIClient()
+    other_client.cookies[settings.SESSION_COOKIE_NAME] = old_session
+    assert other_client.get('/api/v1/auth/me/').status_code == 403
+
+
+
+@pytest.mark.parametrize('endpoint', ['register', 'login', 'logout'])
+def test_auth_csrf_error_is_json(endpoint):
+    # Анонимные POST тоже защищены; ошибка данных не должна опередить CSRF.
+    client = APIClient(enforce_csrf_checks=True)
+    response = client.post(f'/api/v1/auth/{endpoint}/', {}, format='json')
+    assert response.status_code == 403
+    assert response.json() == {
+        'code': 'csrf_failed',
+        'detail': 'Не удалось проверить запрос. Обновите страницу.',
+    }
+    assert 'no-store' in response['Cache-Control']
+
+
+def test_admin_csrf_failure_keeps_html():
+    # JSON-обработчик auth API не меняет стандартную CSRF-страницу Admin.
+    client = APIClient(enforce_csrf_checks=True)
+    response = client.post('/admin/login/', {})
+    assert response.status_code == 403
+    assert response['Content-Type'].startswith('text/html')
+
+
+@pytest.mark.parametrize('endpoint', ['register', 'login', 'logout'])
+def test_auth_get_does_not_allow_changes(endpoint):
+    # Создание аккаунта, вход и выход доступны только через POST.
+    response = APIClient().get(f'/api/v1/auth/{endpoint}/')
+    assert response.status_code == 405
+    assert 'no-store' in response['Cache-Control']
