@@ -6,8 +6,8 @@ from rest_framework.response import Response
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.views import APIView
 
-from .serializers import RegisterSerializer, UserSerializer
-from django.contrib.auth import get_user_model, login
+from .serializers import RegisterSerializer, UserSerializer, UserLoginSerializer
+from django.contrib.auth import get_user_model, login, authenticate, logout
 
 User = get_user_model()
 
@@ -42,3 +42,26 @@ class RegisterAPIView(APIView):
         )
         login(request, user)
         return Response(UserSerializer(user).data, status=201)
+
+@method_decorator(csrf_protect, name='dispatch')
+class LoginAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        if request.user.is_authenticated:
+            return Response({'message': 'Вы уже вошли в аккаунт.'},
+                            status=409
+                            )
+        serializer = UserLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = authenticate(request, email=data['email'], password=data['password'])
+        if user is not None:
+            login(request, user)
+            return Response(UserSerializer(user).data, status=200)
+        else:
+            return Response({'code': 'invalid_credentials',
+                             'detail': 'Неверная почта или пароль.'},
+                           status=400
+                           )
+

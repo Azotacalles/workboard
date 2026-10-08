@@ -88,12 +88,14 @@ def test_superuser_can_be_saved_in_postgresql(django_user_model):
 
 @pytest.mark.django_db
 def test_me_requires_authentication():
+    # Клиент без сессии не должен получать данные пользователя.
     client = APIClient()
     response = client.get('/api/v1/auth/me/')
     assert response.status_code == 403
 
 @pytest.mark.django_db
 def test_me_returns_current_user(django_user_model):
+    # Проверяем /me/ с готовой сессией; вход по паролю здесь не тестируем.
     user = django_user_model.objects.create_user(
         email="user@example.com",
         username="user",
@@ -113,6 +115,7 @@ def test_me_returns_current_user(django_user_model):
     }
 
 def test_get_csrf(django_user_model):
+    # Анонимный GET выдаёт токен в JSON и устанавливает отдельную CSRF-cookie.
     client = APIClient()
     response = client.get('/api/v1/auth/csrf/')
     assert response.status_code == 200
@@ -127,6 +130,7 @@ def test_get_csrf(django_user_model):
 
 @pytest.mark.django_db
 def test_register(django_user_model):
+    # Полный путь: CSRF → регистрация → автоматический вход → /me/.
     client = APIClient(enforce_csrf_checks=True)
     csrf_response = client.get('/api/v1/auth/csrf/')
     assert csrf_response.status_code == 200
@@ -170,6 +174,7 @@ def test_register(django_user_model):
 
 @pytest.mark.django_db
 def test_register_requires_csrf(django_user_model):
+    # Даже с корректными данными запрос без CSRF не должен создать аккаунт.
     client = APIClient(enforce_csrf_checks=True)
     count_before = django_user_model.objects.count()
     response = client.post('/api/v1/auth/register/', {
@@ -183,6 +188,7 @@ def test_register_requires_csrf(django_user_model):
 
 @pytest.mark.django_db
 def test_register_rejects_mismatched_passwords(django_user_model):
+    # CSRF корректен, но разные пароли дают ошибку поля без создания пользователя.
     client = APIClient(enforce_csrf_checks=True)
     token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
     count_before = django_user_model.objects.count()
@@ -202,6 +208,7 @@ def test_register_rejects_mismatched_passwords(django_user_model):
     ('another@example.com', 201),
 ])
 def test_register_duplicate_fields(django_user_model, email, expected_status):
+    # Два запуска: повтор email запрещён, повтор username с новым email разрешён.
     django_user_model.objects.create_user(
         email='existing@example.com', username='user', password='test-password',
     )
@@ -220,3 +227,94 @@ def test_register_duplicate_fields(django_user_model, email, expected_status):
         assert django_user_model.objects.count() == count_before
     else:
         assert django_user_model.objects.count() == count_before + 1
+
+@pytest.mark.django_db
+def test_user_login(django_user_model):
+    # Создаём аккаунт без сессии, затем входим настоящим POST и проверяем /me/.
+    # Пробелы в пароле сохраняются; регистр и пробелы по краям email игнорируются.
+    password = ' passASD213! '
+    user = django_user_model.objects.create_user(
+        email='new_user@example.com', username='new_user', password=password,
+    )
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/login/', {
+        'email': ' NEW_USER@EXAMPLE.COM ',
+        'password': password,
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+
+    expected = {'id': user.pk, 'email': user.email, 'username': user.username}
+    assert response.status_code == 200, response.content
+    assert response.json() == expected
+    response = client.get('/api/v1/auth/me/')
+    assert response.status_code == 200
+    assert response.json() == expected
+
+    # Тот же клиент всё ещё отправляет sessionid пользователя user.
+    # Создание other в БД не меняет эту сессию и не создаёт отдельный клиент.
+    other = django_user_model.objects.create_user(
+        email='other@example.com', username='other', password=password,
+    )
+    # После первого входа CSRF-секрет сменился: берём свежий токен.
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/login/', {
+        'email': other.email, 'password': password,
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    # По правилу проекта уже вошедший клиент не может переключиться через login.
+    assert response.status_code == 409
+    assert client.get('/api/v1/auth/me/').json() == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('case', ['wrong_password', 'unknown_email', 'inactive'])
+def test_login_rejects_invalid_credentials(django_user_model, case):
+    # Три запуска: неверный пароль, неизвестная почта и неактивный аккаунт.
+    # Ответ одинаков во всех случаях; после отказа клиент остаётся анонимным.
+    password = 'passASD213!'
+    user = django_user_model.objects.create_user(
+        email='existing@example.com', username='user', password=password,
+        is_active=case != 'inactive',
+    )
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/login/', {
+        'email': 'unknown@example.com' if case == 'unknown_email' else user.email,
+        'password': 'wrong-password' if case == 'wrong_password' else password,
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 400
+    assert response.json() == {
+        'code': 'invalid_credentials',
+        'detail': 'Неверная почта или пароль.',
+    }
+    assert client.get('/api/v1/auth/me/').status_code == 403
+
+
+@pytest.mark.django_db
+def test_login_requires_csrf(django_user_model):
+    # Правильного пароля недостаточно: без CSRF вход и создание сессии запрещены.
+    password = 'passASD213!'
+    user = django_user_model.objects.create_user(
+        email='existing@example.com', username='user', password=password,
+    )
+    client = APIClient(enforce_csrf_checks=True)
+    response = client.post('/api/v1/auth/login/', {
+        'email': user.email, 'password': password,
+    }, format='json')
+    assert response.status_code == 403
+    assert client.get('/api/v1/auth/me/').status_code == 403
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('payload, field', [
+    ({'password': 'passASD213!'}, 'email'),
+    ({'email': 'user@example.com'}, 'password'),
+    ({'email': 'not-an-email', 'password': 'passASD213!'}, 'email'),
+])
+def test_login_validates_input(payload, field):
+    # Пропущенные поля и некорректный email дают 400 с именем проблемного поля.
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/login/', payload, format='json',
+                           HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 400
+    assert field in response.json()

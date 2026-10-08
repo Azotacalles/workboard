@@ -38,3 +38,12 @@ class RegisterSerializer(serializers.Serializer):
         except DjangoValidationError as exception:
             raise serializers.ValidationError({'password': exception.messages})
         return data
+
+
+class UserLoginSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_email(self, data):
+        email = User.objects.normalize_email(data)
+        return email
