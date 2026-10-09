@@ -389,7 +389,7 @@ def test_user_logout(django_user_model):
     # Повторный logout разрешён анонимному клиенту с корректным CSRF.
     response = client.post('/api/v1/auth/logout/', HTTP_X_CSRFTOKEN=token)
     assert response.status_code == 204
-    assert response.content == ''
+    assert response.content == b''
 
     # Возврат старой cookie не восстанавливает удалённую серверную сессию.
     other_client = APIClient()
