@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import './App.css'
+import './api/client.js'
 
 function App() {
   const [check, setCheck] = useState(null);

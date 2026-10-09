@@ -30,9 +30,6 @@ SECRET_KEY = env('SECRET_KEY')
 DEBUG = env('DEBUG')
 
 ALLOWED_HOSTS = []
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-]
 
 AUTH_USER_MODEL = 'accounts.User'
 
@@ -124,6 +121,9 @@ REST_FRAMEWORK = {
 # Sessions
 SESSION_COOKIE_AGE = 1209600
 SESSION_SAVE_EVERY_REQUEST = False
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_FAILURE_VIEW = 'accounts.views.csrf_failure'
 
 # Internationalization
