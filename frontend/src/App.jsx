@@ -1,37 +1,120 @@
-import { useState, useEffect } from "react";
-import './App.css'
-import './api/client.js'
+import { useState, useEffect } from 'react';
+import './App.css';
+import { getMe, logout } from './api/client.js';
+import LoginForm from './auth/LoginForm.jsx';
+import RegisterForm from './auth/RegisterForm.jsx';
+import AuthError from './auth/AuthError.jsx';
 
 function App() {
-  const [check, setCheck] = useState(null);
+    const [user, setUser] = useState(null);
+    const [status, setStatus] = useState('loading');
+    const [errorMessage, setErrorMessage] = useState('');
+    const [attempt, setAttempt] = useState(0);
+    const [loggingOut, setLoggingOut] = useState(false);
+    const [logoutError, setLogoutError] = useState(null);
+    const [form, setForm] = useState('login');
+    const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-      async function handleCheck() {
-          try {
-              const response = await fetch('http://localhost:8000/api/v1/')
+    useEffect(() => {
+        let ignore = false;
 
-              if (!response.ok) {
-                  throw Error(response.statusText);
-              }
-              const data = await response.json();
-              setCheck(data)
-          } catch (error) {
-              console.error(error)
-          }
-      }
+        async function loadMe() {
+            try {
+                const data = await getMe();
+                if (ignore) return;
+                setUser(data);
+                setStatus('success');
+            } catch (error) {
+                if (ignore) return;
+                const isGuest = error.status === 403 && error.data?.code === 'not_authenticated';
+                if (isGuest) {
+                    setUser(null);
+                    setStatus('success');
+                } else {
+                    setErrorMessage('Не удалось проверить вход. Попробуйте ещё раз.');
+                    setStatus('error');
+                }
+            }
+        }
 
-      handleCheck();
-  }, [])
+        loadMe();
+        // Ответ прошлой проверки не должен менять уже неактуальное состояние.
+        return () => { ignore = true; };
+    }, [attempt]);
 
+    function handleRetry() {
+        if (submitting || loggingOut) return;
+        setErrorMessage('');
+        setStatus('loading');
+        setAttempt(previousAttempt => previousAttempt + 1);
+    }
 
+    function handleLogin(userData) {
+        setUser(userData);
+        setStatus('success');
+        setErrorMessage('');
+        setLogoutError(null);
+    }
 
-  return (
-    <>
-        <h1>WorkBoard React</h1>
-        <p>{ check?.status }</p>
+    async function handleLogout() {
+        // Проверяем занятость до очистки ошибки и до try/finally.
+        if (loggingOut) return;
+        setLogoutError(null);
+        setLoggingOut(true);
+        try {
+            await logout();
+            // Гостя показываем только после успешного серверного выхода.
+            setUser(null);
+            setForm('login');
+        } catch (error) {
+            setLogoutError(error);
+        } finally {
+            setLoggingOut(false);
+        }
+    }
 
-    </>
-  )
+    return (
+        <>
+            <h1>WorkBoard React</h1>
+            {status === 'loading' && <p>Проверяем вход…</p>}
+            {status === 'error' && (
+                <div>
+                    {/* Ошибку проверки показываем один раз, вместе с повтором GET. */}
+                    <p role="alert">{errorMessage}</p>
+                    <button type="button" onClick={handleRetry}>Повторить</button>
+                </div>
+            )}
+            {status === 'success' && (
+                user ? (
+                    <div>
+                        <p>Привет, {user.username}</p>
+                        <AuthError
+                            error={logoutError}
+                            onClearError={() => setLogoutError(null)}
+                            onPendingChange={setLoggingOut}
+                            onCheckSession={handleRetry}
+                        />
+                        <button type="button" onClick={handleLogout} disabled={loggingOut}>
+                            {loggingOut ? 'Подождите…' : 'Выйти'}
+                        </button>
+                    </div>
+                ) : (
+                    <div>
+                        {/* Одновременно видна одна форма: вход и регистрация не конкурируют. */}
+                        {form === 'login' ? (
+                            <LoginForm onLogin={handleLogin} onPendingChange={setSubmitting} onCheckSession={handleRetry} />
+                        ) : (
+                            <RegisterForm onLogin={handleLogin} onPendingChange={setSubmitting} onCheckSession={handleRetry} />
+                        )}
+                        <button type="button" disabled={submitting}
+                            onClick={() => setForm(form === 'login' ? 'register' : 'login')}>
+                            {form === 'login' ? 'Создать аккаунт' : 'Уже есть аккаунт? Войти'}
+                        </button>
+                    </div>
+                )
+            )}
+        </>
+    );
 }
 
-export default App
+export default App;

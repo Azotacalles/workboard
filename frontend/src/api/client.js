@@ -56,7 +56,13 @@ async function authenticate(path, data) {
     const user = await apiRequest(path, { method: 'POST', data });
     // Вход меняет CSRF-секрет. Старый токен больше не используем.
     csrfToken = null;
-    await getCSRF();
+    try {
+        await getCSRF();
+    } catch (error) {
+        // POST уже успешен: форма должна предложить проверить сессию, а не повторять вход.
+        error.authenticatedUser = user;
+        throw error;
+    }
     return user;
 }
 
