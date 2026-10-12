@@ -2,17 +2,29 @@ import pytest
 from django.conf import settings
 from django.db import connection, IntegrityError
 from rest_framework.test import APIClient
+from accounts.emails import send_registration_email
+
+
+@pytest.fixture
+def user_factory(db, django_user_model):
+    # Фабрика создаёт пользователя для каждого вызова; нужные тесту поля можно переопределить.
+    def create_user(**overrides):
+        data = {
+            'email': 'user@gmail.com',
+            'username': 'user',
+            'password': 'test-password',
+        }
+        data.update(overrides)
+        return django_user_model.objects.create_user(**data)
+
+    return create_user
 
 
 @pytest.mark.django_db
-def test_user_can_be_saved_in_postgresql(django_user_model):
+def test_user_can_be_saved_in_postgresql(django_user_model, user_factory):
     assert connection.vendor == "postgresql"
 
-    user = django_user_model.objects.create_user(
-        email="user@gmail.com",
-        username="user",
-        password="test-password",
-    )
+    user = user_factory()
 
     saved_user = django_user_model.objects.get(pk=user.pk)
 
@@ -21,30 +33,24 @@ def test_user_can_be_saved_in_postgresql(django_user_model):
     assert saved_user.check_password("test-password")
 
 @pytest.mark.django_db
-def test_user_with_mixed_case_email(django_user_model):
+def test_user_with_mixed_case_email(django_user_model, user_factory):
     assert connection.vendor == "postgresql"
 
-    user = django_user_model.objects.create_user(
+    user = user_factory(
         email="USER@GMail.com",
-        username="user",
-        password="test-password",
     )
     saved_user = django_user_model.objects.get(pk=user.pk)
     assert saved_user.check_password("test-password")
     assert saved_user.email == "user@gmail.com"
 
 @pytest.mark.django_db
-def test_users_with_the_same_username(django_user_model):
+def test_users_with_the_same_username(django_user_model, user_factory):
     assert connection.vendor == "postgresql"
-    user_1 = django_user_model.objects.create_user(
+    user_1 = user_factory(
         email='user1@gmail.com',
-        username="user",
-        password="test-password",
     )
-    user_2 = django_user_model.objects.create_user(
+    user_2 = user_factory(
         email='user2@gmail.com',
-        username="user",
-        password="test-password",
     )
 
     saved_user_1 = django_user_model.objects.get(pk=user_1.pk)
@@ -54,19 +60,13 @@ def test_users_with_the_same_username(django_user_model):
     assert saved_user_2.username == 'user'
 
 @pytest.mark.django_db
-def test_users_with_the_same_email(django_user_model):
+def test_users_with_the_same_email(django_user_model, user_factory):
     assert connection.vendor == "postgresql"
-    user_1 = django_user_model.objects.create_user(
-        email='user@gmail.com',
-        username="user",
-        password="test-password",
-    )
+    user_1 = user_factory()
 
     with pytest.raises(IntegrityError):
-        user_2 = django_user_model.objects.create_user(
+        user_2 = user_factory(
             email='USER@gmail.com',
-            username="user",
-            password="test-password",
         )
 
 @pytest.mark.django_db
@@ -95,12 +95,10 @@ def test_me_requires_authentication():
     assert response.status_code == 403
 
 @pytest.mark.django_db
-def test_me_returns_current_user(django_user_model):
+def test_me_returns_current_user(user_factory):
     # Проверяем /me/ с готовой сессией; вход по паролю здесь не тестируем.
-    user = django_user_model.objects.create_user(
+    user = user_factory(
         email="user@example.com",
-        username="user",
-        password="test-password",
     )
 
     client = APIClient()
@@ -217,10 +215,10 @@ def test_register_rejects_mismatched_passwords(django_user_model):
     ('EXISTING@example.com', 400),
     ('another@example.com', 201),
 ])
-def test_register_duplicate_fields(django_user_model, email, expected_status):
+def test_register_duplicate_fields(django_user_model, user_factory, email, expected_status):
     # Два запуска: повтор email запрещён, повтор username с новым email разрешён.
-    django_user_model.objects.create_user(
-        email='existing@example.com', username='user', password='test-password',
+    user_factory(
+        email='existing@example.com',
     )
     client = APIClient(enforce_csrf_checks=True)
     token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
@@ -239,11 +237,11 @@ def test_register_duplicate_fields(django_user_model, email, expected_status):
         assert django_user_model.objects.count() == count_before + 1
 
 @pytest.mark.django_db
-def test_user_login(django_user_model):
+def test_user_login(user_factory):
     # Создаём аккаунт без сессии, затем входим настоящим POST и проверяем /me/.
     # Пробелы в пароле сохраняются; регистр и пробелы по краям email игнорируются.
     password = ' passASD213! '
-    user = django_user_model.objects.create_user(
+    user = user_factory(
         email='new_user@example.com', username='new_user', password=password,
     )
     client = APIClient(enforce_csrf_checks=True)
@@ -263,7 +261,7 @@ def test_user_login(django_user_model):
 
     # Тот же клиент всё ещё отправляет sessionid пользователя user.
     # Создание other в БД не меняет эту сессию и не создаёт отдельный клиент.
-    other = django_user_model.objects.create_user(
+    other = user_factory(
         email='other@example.com', username='other', password=password,
     )
     # После первого входа CSRF-секрет сменился: берём свежий токен.
@@ -283,12 +281,12 @@ def test_user_login(django_user_model):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize('case', ['wrong_password', 'unknown_email', 'inactive'])
-def test_login_rejects_invalid_credentials(django_user_model, case):
+def test_login_rejects_invalid_credentials(user_factory, case):
     # Три запуска: неверный пароль, неизвестная почта и неактивный аккаунт.
     # Ответ одинаков во всех случаях; после отказа клиент остаётся анонимным.
     password = 'passASD213!'
-    user = django_user_model.objects.create_user(
-        email='existing@example.com', username='user', password=password,
+    user = user_factory(
+        email='existing@example.com', password=password,
         is_active=case != 'inactive',
     )
     client = APIClient(enforce_csrf_checks=True)
@@ -306,11 +304,11 @@ def test_login_rejects_invalid_credentials(django_user_model, case):
 
 
 @pytest.mark.django_db
-def test_login_requires_csrf(django_user_model):
+def test_login_requires_csrf(user_factory):
     # Правильного пароля недостаточно: без CSRF вход и создание сессии запрещены.
     password = 'passASD213!'
-    user = django_user_model.objects.create_user(
-        email='existing@example.com', username='user', password=password,
+    user = user_factory(
+        email='existing@example.com', password=password,
     )
     client = APIClient(enforce_csrf_checks=True)
     response = client.post('/api/v1/auth/login/', {
@@ -337,11 +335,9 @@ def test_login_validates_input(payload, field):
 
 
 @pytest.mark.django_db
-def test_user_logout(django_user_model):
+def test_user_logout(user_factory):
     # Настоящий вход → проверка CSRF на выходе → выход → повтор → старая cookie.
-    user = django_user_model.objects.create_user(
-        email='user@gmail.com',
-        username='user',
+    user = user_factory(
         password='passASD123!',
     )
     client = APIClient(enforce_csrf_checks=True)
@@ -425,3 +421,20 @@ def test_auth_get_does_not_allow_changes(endpoint):
     response = APIClient().get(f'/api/v1/auth/{endpoint}/')
     assert response.status_code == 405
     assert 'no-store' in response['Cache-Control']
+
+@pytest.mark.django_db
+def test_send_registration_email(user_factory, mailoutbox):
+    password = 'passABC123!'
+    user = user_factory(
+        password = password,
+    )
+    send_registration_email(user)
+    assert len(mailoutbox) == 1
+    message = mailoutbox[0]
+    assert message.to == [user.email]
+    assert message.subject == 'Регистрация в WorkBoard'
+    assert 'Добро пожаловать в WorkBoard!' in message.body
+
+    # В письмо не должны попасть ни исходный пароль, ни его хеш.
+    assert password not in message.body
+    assert user.password not in message.body
