@@ -28,6 +28,7 @@ jobs:
           POSTGRES_USER: ci_postgres
           POSTGRES_PASSWORD: ci_postgres
           POSTGRES_DB: ci_workboard
+          FRONTEND_URL: http://localhost:5173
         ports:
           - 5432:5432
         options: >-
