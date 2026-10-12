@@ -1,4 +1,5 @@
 from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.db import transaction
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils.cache import patch_cache_control
@@ -9,7 +10,8 @@ from rest_framework.exceptions import NotAuthenticated
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from functools import partial
+from .emails import send_registration_email
 from .serializers import RegisterSerializer, UserLoginSerializer, UserSerializer
 
 User = get_user_model()
@@ -71,11 +73,13 @@ class RegisterAPIView(AuthAPIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        user = User.objects.create_user(
-            email=data['email'],
-            username=data['username'],
-            password=data['password'],
-        )
+        with transaction.atomic():
+            user = User.objects.create_user(
+                email=data['email'],
+                username=data['username'],
+                password=data['password'],
+            )
+            transaction.on_commit(partial(send_registration_email, user=user))
         login(request, user)
         return Response(UserSerializer(user).data, status=201)
 
