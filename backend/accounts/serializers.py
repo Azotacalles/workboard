@@ -47,3 +47,11 @@ class UserLoginSerializer(serializers.Serializer):
     def validate_email(self, data):
         email = User.objects.normalize_email(data)
         return email
+
+
+class PasswordResetSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validated_email(self, data):
+        email = User.objects.normalize_email(data)
+        return email

@@ -1,18 +1,26 @@
-from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.contrib.auth import authenticate, get_user_model, login, logout, settings
 from django.db import transaction
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from django.views.csrf import csrf_failure as django_csrf_failure
 from django.views.decorators.csrf import csrf_protect
+from django.contrib.auth.tokens import default_token_generator
 from rest_framework.exceptions import NotAuthenticated
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from functools import partial
-from .emails import send_registration_email
-from .serializers import RegisterSerializer, UserLoginSerializer, UserSerializer
+from .emails import send_registration_email, send_password_reset_email
+from .serializers import (
+    RegisterSerializer,
+    UserLoginSerializer,
+    UserSerializer,
+    PasswordResetSerializer
+)
 
 User = get_user_model()
 
@@ -113,3 +121,24 @@ class LogoutAPIView(AuthAPIView):
         # Повторный выход тоже успешен: logout допустим для анонимного запроса.
         logout(request)
         return Response(status=204)
+
+
+class PasswordResetAPIView(AuthAPIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = User.objects.filter(email=data['email'], is_active=True).first()
+        if user is not None and user.has_usable_password():
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            frontend_url = settings.FRONTEND_URL.rstrip('/')
+            reset_url = f'{frontend_url}/reset-password?uid={uid}&token={token}'
+            send_password_reset_email(user, reset_url)
+        return Response({
+            'detail': (
+                'Если для этого адреса доступно восстановление мы отправим письмо с инструкцией.'
+            ),
+        })

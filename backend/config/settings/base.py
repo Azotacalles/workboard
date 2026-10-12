@@ -152,3 +152,7 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+PASSWORD_RESET_TIMEOUT = 3600
+
+FRONTEND_URL = env('FRONTEND_URL')
