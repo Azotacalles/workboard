@@ -4,11 +4,13 @@
 
 ## Текущее состояние
 
-Подготовлен development-каркас: Django, React на JavaScript, PostgreSQL, Docker Compose, custom User и два smoke-теста. React запрашивает `/api/v1/` и показывает статус backend.
+Работают регистрация, вход по email, текущий пользователь, выход и восстановление пароля по ссылке из письма. Backend использует сессии Django и CSRF-защиту; React показывает формы, ошибки полей и ошибки связи. После обновления страницы frontend заново проверяет сессию через `/me/`.
 
-Бизнес-функции ещё не реализованы. Далее запланированы аутентификация, workspace, роли участников, проекты, задачи, комментарии и история действий. Celery, Redis, production-развёртывание и CI/CD появятся позже.
+Приветственное письмо отправляется после commit регистрации. Восстановление не раскрывает существование аккаунта и не выполняет автоматический вход после смены пароля. Ошибка SMTP логируется и не отменяет созданный аккаунт.
 
-Этап 1 завершён. Миграции применены в основной development-БД; health endpoint работает через Django REST Framework. Backend-тесты, Django check, ESLint и сборка frontend проходят. Создан superuser; вручную проверены сохранение данных после перезапуска и hot reload backend и frontend. Health endpoint проверяет ответ API, но не доступность БД.
+GitHub Actions запускает проверки backend и frontend при push и pull request. Workspace, роли участников, проекты, задачи, комментарии и история действий — следующие этапы. TanStack Query установлен, но пока не используется: запросы написаны через `fetch`, состояние — через React hooks.
+
+Конфигурация предназначена для локальной разработки по HTTP через `localhost`. Production-развёртывание, Celery и Redis пока не подготовлены. Публичный health endpoint проверяет ответ API, но не доступность БД.
 
 ## Стек
 
@@ -28,12 +30,14 @@ backend/
       base.py
       dev.py
       prod.py
-  accounts/       # Custom User
+  accounts/       # User, auth API, admin-формы, письма и тесты
   workspaces/     # Каркас приложения
   projects/       # Каркас приложения
   tasks/          # Каркас приложения и текущий health endpoint
 frontend/
   src/
+    api/         # fetch-клиент с cookies и CSRF
+    auth/        # Формы входа, регистрации и восстановления
   package.json
   package-lock.json
 Dockerfile       # Образ backend
@@ -41,6 +45,7 @@ Dockerfile       # Образ backend
 .env.example
 requirements.txt
 docker-compose.yml
+.github/workflows/ci.yml
 ```
 
 ## Первый запуск
@@ -67,9 +72,13 @@ DATABASE_URL=postgres://workboard:workboard_dev@db:5432/workboard
 POSTGRES_DB=workboard
 POSTGRES_USER=workboard
 POSTGRES_PASSWORD=workboard_dev
+FRONTEND_URL=http://localhost:5173
+SMTP_PASSWORD=
 ```
 
 `DATABASE_URL` и `POSTGRES_*` должны описывать одну базу и одного пользователя. Для собственного пароля со специальными символами используй URL-кодирование в `DATABASE_URL`. `db` — имя сервиса внутри сети Compose, а не адрес для запуска Django напрямую с компьютера.
+
+`FRONTEND_URL` задаёт начало ссылки восстановления. Перед проверкой писем выбери SMTP или console по разделу «Почта» ниже: пустой `SMTP_PASSWORD` не позволяет отправлять письма через Gmail.
 
 `.env` не коммитится и не копируется в backend-образ. Compose передаёт переменные в контейнер через `env_file`. Точки входа Django также умеют читать локальный `.env`, если файл доступен. pytest не запускает `manage.py`, поэтому тесты ниже выполняются в контейнере с уже заданным окружением.
 
@@ -94,11 +103,90 @@ docker compose exec backend python backend/manage.py showmigrations
 
 ### 4. Открыть приложение
 
-- Frontend: http://localhost:5173 — должны отображаться `WorkBoard React` и `ok`.
-- Health endpoint: http://localhost:8000/api/v1/ — ожидается `{"status": "ok"}`.
-- Django Admin: http://localhost:8000/admin/ — требует миграций и superuser.
+- [Frontend](http://localhost:5173) — форма входа или приветствие текущего пользователя.
+- [Форма запроса восстановления](http://localhost:5173/forgot-password).
+- [Health endpoint](http://localhost:8000/api/v1/) — ожидается `{"status": "ok"}`, вход не нужен.
+- [Django Admin](http://localhost:8000/admin/) — требует миграций и superuser; вход по email.
 
-Для текущих CORS-настроек открывай frontend через `localhost`, а не `127.0.0.1`.
+Frontend и API должны использовать `localhost`: `127.0.0.1` — другой хост для cookies и другой origin для CORS. В dev разрешён origin `http://localhost:5173`, запросы отправляются с `credentials: 'include'`.
+
+Для pgAdmin на компьютере: host `localhost`, port `5433`, имя БД/пользователь/пароль из `POSTGRES_*`. Внутри Compose Django подключается к `db:5432`. В CI Python работает на runner и подключается к опубликованному порту PostgreSQL через `localhost:5432`.
+
+## Правила аккаунта и сессии
+
+- Email обязателен и уникален без учёта регистра. Пробелы по краям удаляются, весь адрес сохраняется в нижнем регистре. Точки и часть после `+` сохраняются.
+- Username обязателен и используется как отображаемое имя. Повторы разрешены; регистр сохраняется. Для связей с пользователем используется `id`.
+- Пароль проверяют валидаторы Django, в БД хранится хеш. Пробелы в пароле не обрезаются.
+- Регистрация автоматически выполняет вход. Повторный login/register вошедшего клиента возвращает `409`, не переключая аккаунт.
+- Сессия действует 14 дней и не продлевается каждым запросом. Session cookie — `HttpOnly`; обе cookies — `SameSite=Lax`, в dev `Secure=False`.
+- Все auth POST требуют CSRF, в том числе анонимные login/register/reset. После входа CSRF-секрет меняется; клиент получает свежий токен.
+- Logout удаляет текущую серверную сессию. Повторный logout с правильным CSRF допустим; другие сессии не завершаются.
+- Ссылка восстановления действует один час. После смены пароля ссылка и прежние сессии теряют пригодность; далее нужен обычный вход. Владение email при регистрации пока не подтверждается.
+
+## Auth API
+
+Все пути начинаются с `/api/v1/auth/`. Объект пользователя содержит `id`, `username`, `email`.
+
+| Метод и путь | Данные запроса | Успешный ответ |
+| --- | --- | --- |
+| `GET csrf/` | Без тела | `200`, `{"csrfToken": "..."}` и CSRF-cookie |
+| `POST register/` | `email`, `username`, `password`, `password_confirm` | `201`, пользователь и сессия |
+| `POST login/` | `email`, `password` | `200`, пользователь и сессия |
+| `GET me/` | Session cookie | `200`, пользователь |
+| `POST logout/` | Без тела | `204`, пустой ответ |
+| `POST password-reset/` | `email` | `200`, нейтральное сообщение |
+| `POST password-reset/confirm/` | `uid`, `token`, `password`, `password_confirm` | `204`, пустой ответ |
+
+Для POST сначала получи `csrfToken` через GET, затем отправляй cookies и заголовок `X-CSRFToken`. Cookies браузер хранит и прикладывает сам; токен для заголовка хранит JS-клиент. При `csrf_failed` форма предлагает получить свежий токен, после чего пользователь сам повторяет отправку. POST автоматически не повторяется.
+
+Ошибки полей возвращаются с `400` и списками сообщений, например `{"email": ["Этот email уже занят."]}`. Общие ошибки имеют форму `{"code": "...", "detail": "..."}`:
+
+| Статус | Code | Причина |
+| --- | --- | --- |
+| `400` | `invalid_credentials` | Неверные данные входа или неактивный аккаунт |
+| `400` | `invalid_reset_link` | Неверная, просроченная или использованная ссылка |
+| `403` | `not_authenticated` | Нет действующей сессии для `/me/` |
+| `403` | `csrf_failed` | Не прошла проверка CSRF или Origin |
+| `409` | `already_authenticated` | Уже есть сессия при login/register |
+
+Auth-ответы имеют `Cache-Control: no-store`. Успешный logout и подтверждение сброса не содержат JSON: у них статус `204`.
+
+## Почта
+
+Настройка находится в `MAILERS['default']` в `backend/config/settings/base.py`. Сейчас выбран SMTP Gmail: `smtp.gmail.com`, порт `587`, STARTTLS, timeout 10 секунд.
+
+Для своего Gmail-аккаунта:
+
+1. Включи двухэтапную аутентификацию и создай [пароль приложения Google](https://support.google.com/accounts/answer/185833?hl=ru).
+2. Запиши пароль приложения в `.env` как `SMTP_PASSWORD`, без разделяющих пробелов. Обычный пароль Google здесь не используется.
+3. SMTP `username` пока задан прямо в `base.py`. Укажи свой адрес и тот же адрес отправителя в обеих функциях `backend/accounts/emails.py`. Переменной `SMTP_USERNAME` в проекте пока нет.
+4. После изменения `.env` пересоздай backend, чтобы Compose передал новое окружение:
+
+```bash
+docker compose up -d --force-recreate backend
+```
+
+Обычный `docker compose restart backend` не обновляет окружение контейнера. SMTP-пароль не нужно коммитить или добавлять в CI: pytest использует memory backend; CI задаёт только непустую заглушку для чтения настроек.
+
+Для разработки без настоящей доставки замени настройку `MAILERS` на console backend:
+
+```python
+MAILERS = {
+    'default': {
+        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+    },
+}
+```
+
+Console печатает письмо в `docker compose logs -f backend`; в реальный ящик ничего не приходит. SMTP отправляет в ящик. Memory backend в тестах сохраняет письма в `mailoutbox`. Подробности: [Django: email backends](https://docs.djangoproject.com/en/6.1/topics/email/#email-backends).
+
+Ожидаемые ошибки SMTP и подключения логируются в `smtp.log`. В контейнере это `/app/smtp.log`; посмотреть:
+
+```bash
+docker compose exec backend tail -n 30 /app/smtp.log
+```
+
+Успешная регистрация подтверждает создание аккаунта, но не доставку письма. Запрос восстановления возвращает одинаковое сообщение для существующего и неизвестного адреса. При проблеме доставки сначала проверь выбранный backend и лог SMTP; VPN может мешать подключению к SMTP-серверу.
 
 ## Повседневные команды
 
@@ -135,6 +223,9 @@ PostgreSQL хранит данные в named volume `postgres_data`. Коман
 # Конфигурация Django
 docker compose exec backend python backend/manage.py check
 
+# Модели должны соответствовать сохранённым миграциям
+docker compose exec backend python backend/manage.py makemigrations --check --dry-run
+
 # Тесты backend
 docker compose exec -w /app/backend backend python -m pytest -v
 
@@ -143,7 +234,36 @@ docker compose exec frontend npm run lint
 docker compose exec frontend npm run build
 ```
 
-Сейчас есть два теста: ответ health endpoint и сохранение custom User в PostgreSQL. pytest-django создаёт отдельную тестовую БД и применяет к ней миграции. Успешные тесты не означают, что миграции применены к основной development-БД. Пользователю PostgreSQL требуется право создавать тестовые базы.
+Тесты проверяют User/manager, регистрацию, вход, выход, независимые и истёкшие сессии, CSRF/Origin, письма, восстановление и ошибки без побочных изменений. В `backend/accounts/tests.py` есть комментарии к сценариям. Health endpoint проверяется отдельно.
+
+pytest-django создаёт отдельную PostgreSQL-БД и применяет к ней миграции; тестовые письма наружу не отправляются. Успешные тесты не означают, что миграции применены к основной development-БД. Пользователю PostgreSQL требуется право создавать тестовые базы. `makemigrations --check --dry-run` проверяет описание моделей, но не применяет миграции.
+
+Для отдельного сценария:
+
+```bash
+docker compose exec -w /app/backend backend python -m pytest accounts/tests.py::test_user_logout -v
+docker compose exec -w /app/backend backend python -m pytest -k password_reset -v
+```
+
+### GitHub Actions
+
+Workflow `.github/workflows/ci.yml` выполняет Django check, проверку миграций, pytest, ESLint и Vite build. Посмотреть результат можно во вкладке [Actions](https://github.com/Azotacalles/workboard/actions): открой запуск для нужного commit, затем job `backend` или `frontend`. Зелёный запуск старого commit не проверяет локальные изменения; для новых изменений нужен commit и push.
+
+### Приёмка этапа 2
+
+1. Зарегистрируй аккаунт, проверь приветствие, письмо и сохранение входа после обновления страницы.
+2. Выйди и обнови страницу: должна остаться форма входа. Проверь вход с другим регистром email и ошибку неверного пароля.
+3. Через «Забыли пароль?» получи письмо, открой ссылку, сохрани новый пароль. Старый пароль, старые сессии и использованная ссылка должны перестать работать; новый пароль должен подходить.
+4. Проверь отдельный профиль браузера, ошибки связи при недоступном API, Admin и публичный health endpoint.
+5. Выполни команды проверок выше и проверь CI именно для отправленного commit.
+
+На 13 октября 2026 локально проходят 81 тест, Django check, проверка миграций, ESLint и сборка Vite. В браузере проверены вход с другим регистром email, неверный пароль, сохранение входа после reload, logout/reload, истечение серверной сессии и ошибки связи без ложного успеха. Для ошибок связи использовалась временная имитация отказа `fetch`, без остановки backend.
+
+Регистрация, восстановление, старые пароли/сессии, повтор ссылки, независимость клиентов и сохранение пользователя через Admin покрыты интеграционными тестами PostgreSQL. Отдельный браузерный профиль в этой приёмке не проверялся вручную; перед итоговой отметкой проверь вход в обычном окне и отсутствие этой сессии в инкогнито.
+
+Реальная доставка письма восстановления через Gmail подтверждена пользователем. **Доставка приветственного письма в настоящий ящик ещё не проверена**; memory-тесты обоих писем проходят.
+
+Последний просмотренный [CI для `69f36db`](https://github.com/Azotacalles/workboard/actions/runs/38425534805) завершился ошибкой backend; frontend прошёл. Детальные логи GitHub требуют авторизации. Исправления обработки повреждённого `uid`, формата ошибки email и расширенные тесты из 2.24–2.25 пока находятся в локальных изменениях. Для окончательной приёмки нужен успешный CI после их push, проверка отдельного профиля и настоящего приветственного письма.
 
 ## Изменение кода и зависимостей
 

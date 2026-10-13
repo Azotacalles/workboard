@@ -5,11 +5,14 @@ from smtplib import SMTPException
 import pytest
 from django.conf import settings
 from django.contrib.auth.tokens import default_token_generator
+from django.contrib.sessions.models import Session
 from django.db import connection, IntegrityError
+from django.utils import timezone
 from django.utils.encoding import force_bytes
-from django.utils.http import urlsafe_base64_encode
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from rest_framework.test import APIClient
 from accounts.emails import send_registration_email
+from accounts.serializers import RegisterSerializer
 from urllib.parse import urlsplit, parse_qs
 
 
@@ -26,6 +29,23 @@ def user_factory(db, django_user_model):
         return django_user_model.objects.create_user(**data)
 
     return create_user
+
+
+@pytest.fixture
+def logged_in_client():
+    # Настоящий login вместо force_login: проверяем пароль, CSRF и создание сессии.
+    def login_user(user, password='test-password'):
+        client = APIClient(enforce_csrf_checks=True)
+        token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+        response = client.post('/api/v1/auth/login/', {
+            'email': user.email, 'password': password,
+        }, format='json', HTTP_X_CSRFTOKEN=token)
+        assert response.status_code == 200, response.content
+        # Login меняет CSRF-секрет; для следующих POST нужен свежий токен.
+        token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+        return client, token
+
+    return login_user
 
 
 @pytest.fixture
@@ -72,13 +92,14 @@ def test_user_can_be_saved_in_postgresql(django_user_model, user_factory):
     assert saved_user.email == "user@gmail.com"
     assert saved_user.username == "user"
     assert saved_user.check_password("test-password")
+    assert saved_user.password != 'test-password'
 
 @pytest.mark.django_db
 def test_user_with_mixed_case_email(django_user_model, user_factory):
     assert connection.vendor == "postgresql"
 
     user = user_factory(
-        email="USER@GMail.com",
+        email=" USER@GMail.com ",
     )
     saved_user = django_user_model.objects.get(pk=user.pk)
     assert saved_user.check_password("test-password")
@@ -136,14 +157,13 @@ def test_me_requires_authentication():
     assert response.status_code == 403
 
 @pytest.mark.django_db
-def test_me_returns_current_user(user_factory):
-    # Проверяем /me/ с готовой сессией; вход по паролю здесь не тестируем.
+def test_me_returns_current_user(user_factory, logged_in_client):
+    # /me/ должен узнать пользователя по сессии, полученной настоящим входом.
     user = user_factory(
         email="user@example.com",
     )
 
-    client = APIClient()
-    client.force_login(user)
+    client, _ = logged_in_client(user)
 
     response = client.get("/api/v1/auth/me/")
 
@@ -233,20 +253,6 @@ def test_register(django_user_model, mailoutbox, django_capture_on_commit_callba
     # Повторная регистрация вошедшего клиента не отправляет ещё одно письмо.
     assert callbacks == []
     assert len(mailoutbox) == 1
-
-@pytest.mark.django_db
-def test_register_requires_csrf(django_user_model):
-    # Даже с корректными данными запрос без CSRF не должен создать аккаунт.
-    client = APIClient(enforce_csrf_checks=True)
-    count_before = django_user_model.objects.count()
-    response = client.post('/api/v1/auth/register/', {
-        'email': 'newuser@example.com',
-        'username': 'user',
-        'password': 'Violet!River-72-Copper',
-        'password_confirm': 'Violet!River-72-Copper',
-    }, format='json')
-    assert response.status_code == 403
-    assert django_user_model.objects.count() == count_before
 
 @pytest.mark.django_db
 def test_register_rejects_mismatched_passwords(
@@ -374,21 +380,6 @@ def test_login_rejects_invalid_credentials(user_factory, case):
 
 
 @pytest.mark.django_db
-def test_login_requires_csrf(user_factory):
-    # Правильного пароля недостаточно: без CSRF вход и создание сессии запрещены.
-    password = 'passASD213!'
-    user = user_factory(
-        email='existing@example.com', password=password,
-    )
-    client = APIClient(enforce_csrf_checks=True)
-    response = client.post('/api/v1/auth/login/', {
-        'email': user.email, 'password': password,
-    }, format='json')
-    assert response.status_code == 403
-    assert client.get('/api/v1/auth/me/').status_code == 403
-
-
-@pytest.mark.django_db
 @pytest.mark.parametrize('payload, field', [
     ({'password': 'passASD213!'}, 'email'),
     ({'email': 'user@example.com'}, 'password'),
@@ -464,19 +455,6 @@ def test_user_logout(user_factory):
 
 
 
-@pytest.mark.parametrize('endpoint', ['register', 'login', 'logout'])
-def test_auth_csrf_error_is_json(endpoint):
-    # Анонимные POST тоже защищены; ошибка данных не должна опередить CSRF.
-    client = APIClient(enforce_csrf_checks=True)
-    response = client.post(f'/api/v1/auth/{endpoint}/', {}, format='json')
-    assert response.status_code == 403
-    assert response.json() == {
-        'code': 'csrf_failed',
-        'detail': 'Не удалось проверить запрос. Обновите страницу.',
-    }
-    assert 'no-store' in response['Cache-Control']
-
-
 def test_admin_csrf_failure_keeps_html():
     # JSON-обработчик auth API не меняет стандартную CSRF-страницу Admin.
     client = APIClient(enforce_csrf_checks=True)
@@ -485,7 +463,9 @@ def test_admin_csrf_failure_keeps_html():
     assert response['Content-Type'].startswith('text/html')
 
 
-@pytest.mark.parametrize('endpoint', ['register', 'login', 'logout'])
+@pytest.mark.parametrize('endpoint', [
+    'register', 'login', 'logout', 'password-reset', 'password-reset/confirm',
+])
 def test_auth_get_does_not_allow_changes(endpoint):
     # Создание аккаунта, вход и выход доступны только через POST.
     response = APIClient().get(f'/api/v1/auth/{endpoint}/')
@@ -755,22 +735,6 @@ def test_password_reset_rejects_invalid_password(
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('csrf_case', ['missing', 'incorrect'])
-def test_password_reset_confirm_requires_csrf(user_factory, reset_request, csrf_case):
-    user = user_factory()
-    saved_password = user.password
-    client, csrf_token, payload = reset_request(user)
-    # Cookie есть у клиента, но одного её наличия недостаточно: нужен правильный заголовок.
-    headers = {} if csrf_case == 'missing' else {'HTTP_X_CSRFTOKEN': 'A' * 64}
-    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
-                           format='json', **headers)
-    assert response.status_code == 403
-    assert response.json()['code'] == 'csrf_failed'
-    user.refresh_from_db()
-    assert user.password == saved_password
-
-
-@pytest.mark.django_db
 def test_password_reset_invalidates_existing_sessions(user_factory, reset_request):
     user = user_factory()
     previous_clients = [APIClient(enforce_csrf_checks=True), APIClient(enforce_csrf_checks=True)]
@@ -795,3 +759,344 @@ def test_password_reset_invalidates_existing_sessions(user_factory, reset_reques
         assert response.status_code == 403
         assert response.json()['code'] == 'not_authenticated'
     assert client.get('/api/v1/auth/me/').status_code == 403
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('endpoint', [
+    'register', 'login', 'logout', 'password-reset', 'password-reset/confirm',
+])
+@pytest.mark.parametrize('rejection', ['missing_token', 'wrong_token', 'untrusted_origin'])
+def test_auth_csrf_rejection_has_no_side_effects(
+    endpoint, rejection, user_factory, logged_in_client, django_user_model,
+    mailoutbox, django_capture_on_commit_callbacks,
+):
+    # Общая проверка всех POST: 403 недостаточно, запись/письмо/сессия не должны измениться.
+    user = user_factory()
+    signed_in, fresh_token = logged_in_client(user)
+    user.refresh_from_db()
+    old_password = user.password
+    old_last_login = user.last_login
+    expected_user = {'id': user.pk, 'email': user.email, 'username': user.username}
+
+    # Logout проверяем со входом; остальные запросы отправляет отдельный анонимный клиент.
+    client = signed_in if endpoint == 'logout' else APIClient(enforce_csrf_checks=True)
+    token = fresh_token if endpoint == 'logout' else client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    new_password = 'Violet!River-72-Copper'
+    payloads = {
+        'register': {'email': 'new@example.com', 'username': 'new',
+                     'password': new_password, 'password_confirm': new_password},
+        'login': {'email': user.email, 'password': 'test-password'},
+        'logout': {},
+        'password-reset': {'email': user.email},
+        'password-reset/confirm': {
+            'uid': urlsafe_base64_encode(force_bytes(user.pk)),
+            'token': default_token_generator.make_token(user),
+            'password': new_password, 'password_confirm': new_password,
+        },
+    }
+    headers = {'HTTP_X_CSRFTOKEN': token}
+    if rejection == 'missing_token':
+        headers = {}
+    elif rejection == 'wrong_token':
+        # Меняем секрет cookie при сохранении корректного формата заголовка.
+        secret = client.cookies[settings.CSRF_COOKIE_NAME].value
+        headers['HTTP_X_CSRFTOKEN'] = ('A' if secret[0] != 'A' else 'B') + secret[1:]
+    else:
+        # Токен правильный: причиной отказа должен стать именно посторонний Origin.
+        headers['HTTP_ORIGIN'] = 'https://untrusted.example'
+
+    user_count = django_user_model.objects.count()
+    session_keys = set(Session.objects.values_list('session_key', flat=True))
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        response = client.post(f'/api/v1/auth/{endpoint}/', payloads[endpoint],
+                               format='json', **headers)
+    assert response.status_code == 403
+    assert response.json() == {
+        'code': 'csrf_failed',
+        'detail': 'Не удалось проверить запрос. Обновите страницу.',
+    }
+    assert 'no-store' in response['Cache-Control']
+    assert django_user_model.objects.count() == user_count
+    assert set(Session.objects.values_list('session_key', flat=True)) == session_keys
+    user.refresh_from_db()
+    assert user.password == old_password
+    assert user.last_login == old_last_login
+    assert callbacks == []
+    assert mailoutbox == []
+    assert signed_in.get('/api/v1/auth/me/').json() == expected_user
+    if endpoint != 'logout':
+        assert settings.SESSION_COOKIE_NAME not in client.cookies
+        assert client.get('/api/v1/auth/me/').json()['code'] == 'not_authenticated'
+
+
+@pytest.mark.django_db
+def test_clients_keep_independent_sessions(user_factory, logged_in_client):
+    # Два браузера видят разных пользователей; выход первого не завершает второй вход.
+    first = user_factory(email='first@example.com', username='first')
+    second = user_factory(email='second@example.com', username='second')
+    first_client, first_token = logged_in_client(first)
+    second_client, _ = logged_in_client(second)
+    for client, user in [(first_client, first), (second_client, second)]:
+        assert client.get('/api/v1/auth/me/').json() == {
+            'id': user.pk, 'email': user.email, 'username': user.username,
+        }
+    first_session = first_client.cookies[settings.SESSION_COOKIE_NAME].value
+    second_session = second_client.cookies[settings.SESSION_COOKIE_NAME].value
+    assert first_session != second_session
+    response = first_client.post('/api/v1/auth/logout/', HTTP_X_CSRFTOKEN=first_token)
+    assert response.status_code == 204
+    assert not Session.objects.filter(session_key=first_session).exists()
+    assert Session.objects.filter(session_key=second_session).exists()
+    assert first_client.get('/api/v1/auth/me/').json()['code'] == 'not_authenticated'
+    assert second_client.get('/api/v1/auth/me/').json()['id'] == second.pk
+
+
+@pytest.mark.django_db
+def test_me_rejects_expired_server_session(user_factory, logged_in_client):
+    user = user_factory()
+    client, _ = logged_in_client(user)
+    session_key = client.cookies[settings.SESSION_COOKIE_NAME].value
+    # Cookie всё ещё есть. Истёк именно срок серверной записи, а не браузерной cookie.
+    Session.objects.filter(session_key=session_key).update(
+        expire_date=timezone.now() - timedelta(seconds=1),
+    )
+    assert client.cookies[settings.SESSION_COOKIE_NAME].value == session_key
+    response = client.get('/api/v1/auth/me/')
+    assert response.status_code == 403
+    assert response.json() == {
+        'code': 'not_authenticated',
+        'detail': 'Необходим вход в приложение.',
+    }
+    assert 'no-store' in response['Cache-Control']
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('field, value', [
+    ('email', None), ('username', None), ('password', None), ('password_confirm', None),
+    ('email', 'not-an-email'), ('username', 'bad name!'), ('password', 'short'),
+], ids=['missing_email', 'missing_username', 'missing_password', 'missing_confirmation',
+        'invalid_email', 'invalid_username', 'weak_password'])
+def test_register_rejects_invalid_fields(
+    field, value, django_user_model, mailoutbox, django_capture_on_commit_callbacks,
+):
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    payload = {'email': 'new@example.com', 'username': 'new',
+               'password': 'Violet!River-72-Copper', 'password_confirm': 'Violet!River-72-Copper'}
+    if value is None:
+        del payload[field]
+    else:
+        payload[field] = value
+        if field == 'password':
+            payload['password_confirm'] = value
+    count_before = django_user_model.objects.count()
+    # Правильный CSRF позволяет дойти до валидации конкретного поля.
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        response = client.post('/api/v1/auth/register/', payload, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 400
+    assert field in response.json()
+    assert django_user_model.objects.count() == count_before
+    assert callbacks == []
+    assert mailoutbox == []
+    assert settings.SESSION_COOKIE_NAME not in client.cookies
+
+
+@pytest.mark.django_db
+def test_register_does_not_accept_privilege_flags(django_user_model):
+    # Клиент может прислать лишние поля, но регистрация не выдаёт права администратора.
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/api/v1/auth/register/', {
+        'email': 'new@example.com', 'username': 'new',
+        'password': 'Violet!River-72-Copper', 'password_confirm': 'Violet!River-72-Copper',
+        'is_staff': True, 'is_superuser': True,
+    }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 201
+    user = django_user_model.objects.get(pk=response.json()['id'])
+    assert user.is_staff is False
+    assert user.is_superuser is False
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('flag', ['is_staff', 'is_superuser'])
+def test_create_superuser_rejects_false_flags(django_user_model, flag):
+    # Менеджер не должен создавать противоречивого суперпользователя.
+    count_before = django_user_model.objects.count()
+    with pytest.raises(ValueError):
+        django_user_model.objects.create_superuser(
+            email='admin@example.com', username='admin', password='test-password', **{flag: False},
+        )
+    assert django_user_model.objects.count() == count_before
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('stored_email', ['existing@example.com', 'EXISTING@example.com'])
+def test_register_handles_database_email_conflict(
+    stored_email, user_factory, django_user_model, monkeypatch,
+    mailoutbox, django_capture_on_commit_callbacks,
+):
+    existing = user_factory(email='existing@example.com')
+    # Обход менеджера здесь намеренный: проверяем также ограничение Lower(email).
+    django_user_model.objects.filter(pk=existing.pk).update(email=stored_email)
+    # Имитируем устаревшую предварительную проверку. Это НЕ тест параллельных запросов:
+    # вставка ниже действительно нарушает ограничение PostgreSQL после успешной валидации.
+    monkeypatch.setattr(RegisterSerializer, 'validate_email',
+                        lambda self, email: django_user_model.objects.normalize_email(email))
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    count_before = django_user_model.objects.count()
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        response = client.post('/api/v1/auth/register/', {
+            'email': 'existing@example.com', 'username': 'new',
+            'password': 'Violet!River-72-Copper', 'password_confirm': 'Violet!River-72-Copper',
+        }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 400
+    # Формат тот же, что у сериализатора: React объединяет список сообщений через .join().
+    assert response.json() == {'email': ['Этот email уже занят.']}
+    assert django_user_model.objects.count() == count_before
+    assert callbacks == []
+    assert mailoutbox == []
+    assert settings.SESSION_COOKIE_NAME not in client.cookies
+
+
+@pytest.mark.django_db
+def test_register_does_not_hide_other_database_errors(
+    user_factory, django_user_model, monkeypatch, mailoutbox, django_capture_on_commit_callbacks,
+):
+    existing = user_factory()
+
+    def duplicate_primary_key(**kwargs):
+        # Настоящая ошибка PostgreSQL, но на id, а не на email.
+        django_user_model(pk=existing.pk, email=kwargs['email'], username=kwargs['username']).save(
+            force_insert=True,
+        )
+
+    monkeypatch.setattr(django_user_model.objects, 'create_user', duplicate_primary_key)
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    count_before = django_user_model.objects.count()
+    with django_capture_on_commit_callbacks(execute=True) as callbacks:
+        with pytest.raises(IntegrityError) as captured:
+            client.post('/api/v1/auth/register/', {
+                'email': 'new@example.com', 'username': 'new',
+                'password': 'Violet!River-72-Copper', 'password_confirm': 'Violet!River-72-Copper',
+            }, format='json', HTTP_X_CSRFTOKEN=token)
+    assert captured.value.__cause__.diag.constraint_name == 'accounts_user_pkey'
+    assert django_user_model.objects.count() == count_before
+    assert callbacks == []
+    assert mailoutbox == []
+    assert settings.SESSION_COOKIE_NAME not in client.cookies
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('account', ['active', 'unknown', 'inactive', 'unusable_password'])
+def test_password_reset_returns_neutral_response(account, user_factory, mailoutbox, settings):
+    user = user_factory(is_active=account != 'inactive')
+    if account == 'unusable_password':
+        user.set_unusable_password()
+        user.save(update_fields=['password'])
+    old_password = user.password
+    settings.FRONTEND_URL = 'https://frontend.example.test/'
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    email = 'unknown@example.com' if account == 'unknown' else f' {user.email.upper()} '
+    response = client.post('/api/v1/auth/password-reset/', {'email': email},
+                           format='json', HTTP_X_CSRFTOKEN=token)
+    # Ответ не раскрывает существование, активность или пригодность пароля аккаунта.
+    assert response.status_code == 200
+    assert response.json() == {
+        'detail': 'Если для этого адреса доступно восстановление мы отправим письмо с инструкцией.',
+    }
+    assert 'no-store' in response['Cache-Control']
+    user.refresh_from_db()
+    assert user.password == old_password
+    assert settings.SESSION_COOKIE_NAME not in client.cookies
+    if account == 'active':
+        assert len(mailoutbox) == 1
+        message = mailoutbox[0]
+        assert message.to == [user.email]
+        url = next(line.strip() for line in message.body.splitlines()
+                   if line.strip().startswith('https://'))
+        parts = urlsplit(url)
+        assert parts.scheme == 'https'
+        assert parts.netloc == 'frontend.example.test'
+        assert parts.path == '/reset-password'
+        params = parse_qs(parts.query)
+        assert set(params) == {'uid', 'token'}
+        assert urlsafe_base64_decode(params['uid'][0]).decode() == str(user.pk)
+        assert default_token_generator.check_token(user, params['token'][0])
+        assert old_password not in message.body
+    else:
+        assert mailoutbox == []
+
+
+@pytest.mark.django_db
+def test_dev_auth_cookie_attributes(user_factory, logged_in_client):
+    # Проверяем атрибуты Set-Cookie; фактическое поведение браузера проверяется отдельно.
+    client, _ = logged_in_client(user_factory())
+    session_cookie = client.cookies[settings.SESSION_COOKIE_NAME]
+    csrf_cookie = client.cookies[settings.CSRF_COOKIE_NAME]
+    assert session_cookie['httponly'] is True
+    assert session_cookie['max-age'] == settings.SESSION_COOKIE_AGE
+    for cookie in [session_cookie, csrf_cookie]:
+        assert cookie['samesite'] == 'Lax'
+        assert not cookie['secure']  # Dev работает по HTTP.
+
+
+@pytest.mark.parametrize('origin, allowed', [
+    ('http://localhost:5173', True), ('http://127.0.0.1:5173', False),
+])
+def test_cors_preflight_for_auth(origin, allowed):
+    # OPTIONS с этими заголовками браузер отправляет перед JSON POST с CSRF-заголовком.
+    response = APIClient().options('/api/v1/auth/login/',
+        HTTP_ORIGIN=origin,
+        HTTP_ACCESS_CONTROL_REQUEST_METHOD='POST',
+        HTTP_ACCESS_CONTROL_REQUEST_HEADERS='content-type,x-csrftoken',
+    )
+    assert response.status_code == 200
+    if allowed:
+        assert response['Access-Control-Allow-Origin'] == origin
+        assert response['Access-Control-Allow-Credentials'] == 'true'
+        assert 'POST' in response['Access-Control-Allow-Methods']
+        allowed_headers = response['Access-Control-Allow-Headers'].lower()
+        assert 'content-type' in allowed_headers
+        assert 'x-csrftoken' in allowed_headers
+    else:
+        # 200 сам по себе ничего не разрешает: без allow-origin браузер блокирует запрос.
+        assert 'Access-Control-Allow-Origin' not in response
+
+
+@pytest.mark.django_db
+def test_admin_can_create_user_with_repeated_username(user_factory, django_user_model, mailoutbox):
+    # Приёмка Admin: настоящий вход по email и сохранение через подключённую add_form.
+    admin = user_factory(email='admin@example.com', username='admin', is_staff=True, is_superuser=True)
+    user_factory(email='existing@example.com', username='shared')
+    client = APIClient(enforce_csrf_checks=True)
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    response = client.post('/admin/login/', {
+        'username': admin.email, 'password': 'test-password', 'next': '/admin/accounts/user/',
+    }, HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 302
+    assert response['Location'] == '/admin/accounts/user/'
+    assert client.get('/admin/accounts/user/').status_code == 200
+
+    response = client.get('/admin/accounts/user/add/')
+    assert response.status_code == 200
+    form = response.context['adminform'].form
+    assert {'email', 'username', 'password1', 'password2'} <= set(form.fields)
+
+    # Вход Admin тоже меняет CSRF-секрет; повтор username допустим, email нормализуется.
+    token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+    password = 'Violet!River-72-Copper'
+    response = client.post('/admin/accounts/user/add/', {
+        'email': ' NEW@EXAMPLE.COM ', 'username': 'shared',
+        'password1': password, 'password2': password,
+    }, HTTP_X_CSRFTOKEN=token)
+    assert response.status_code == 302, response.content
+    created = django_user_model.objects.get(email='new@example.com')
+    assert created.username == 'shared'
+    assert created.check_password(password)
+    assert created.is_staff is False
+    assert created.is_superuser is False
+    # Приветственное письмо относится к API-регистрации; Admin его не отправляет.
+    assert mailoutbox == []

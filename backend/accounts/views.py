@@ -100,9 +100,9 @@ class RegisterAPIView(AuthAPIView):
                 'unique_email',
                 'accounts_user_email_b2644a56_uniq',
             }:
-                # Возвращаем такую же ошибку поля, как при проверке сериализатора.
+                # Список сообщений совпадает с сериализатором и подходит для React .join().
                 raise serializers.ValidationError({
-                    'email': 'Этот email уже занят.',
+                    'email': ['Этот email уже занят.'],
                 }) from error
 
             # Другие ошибки базы не выдаём за занятую почту.
@@ -170,9 +170,9 @@ class PasswordResetConfirmAPIView(AuthAPIView):
         serializer = PasswordResetConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        uid = urlsafe_base64_decode(data.get('uid')).decode()
         with transaction.atomic():
             try:
+                uid = urlsafe_base64_decode(data.get('uid')).decode()
                 user = User.objects.select_for_update().get(pk=uid)
             except (ValueError, TypeError, OverflowError, User.DoesNotExist) as exception:
                 return Response({
