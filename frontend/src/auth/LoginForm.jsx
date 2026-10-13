@@ -61,6 +61,8 @@ function LoginForm({ onLogin, onPendingChange, onCheckSession }) {
                     <button type="submit">{loading ? 'Входим…' : 'Войти'}</button>
                 </fieldset>
             </form>
+            {/* Ссылка открывает форму frontend; к API форма обращается при отправке. */}
+            <a href="/forgot-password">Забыли пароль?</a>
         </div>
     );
 }

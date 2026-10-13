@@ -1,11 +1,16 @@
 import logging
+from datetime import timedelta
 from smtplib import SMTPException
 
 import pytest
 from django.conf import settings
+from django.contrib.auth.tokens import default_token_generator
 from django.db import connection, IntegrityError
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from rest_framework.test import APIClient
 from accounts.emails import send_registration_email
+from urllib.parse import urlsplit, parse_qs
 
 
 @pytest.fixture
@@ -21,6 +26,39 @@ def user_factory(db, django_user_model):
         return django_user_model.objects.create_user(**data)
 
     return create_user
+
+
+@pytest.fixture
+def reset_request(mailoutbox):
+    # Общая подготовка: настоящий запрос письма и параметры именно из полученной ссылки.
+    # Пользователя передаёт тест, чтобы при необходимости сначала создать старые сессии.
+    def request_reset(user):
+        client = APIClient(enforce_csrf_checks=True)
+        csrf_token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+        response = client.post('/api/v1/auth/password-reset/', {'email': user.email},
+                               format='json', HTTP_X_CSRFTOKEN=csrf_token)
+        assert response.status_code == 200, response.content
+        assert len(mailoutbox) == 1
+        assert mailoutbox[0].to == [user.email]
+
+        reset_url = None
+        for line in mailoutbox[0].body.splitlines():
+            if line.strip().startswith(('http://', 'https://')):
+                reset_url = line.strip()
+                break
+        assert reset_url is not None
+        assert '&amp;' not in reset_url
+        params = parse_qs(urlsplit(reset_url).query)
+        password = 'Violet!River-72-Copper'
+        payload = {
+            'uid': params['uid'][0],
+            'token': params['token'][0],
+            'password': password,
+            'password_confirm': password,
+        }
+        return client, csrf_token, payload
+
+    return request_reset
 
 
 @pytest.mark.django_db
@@ -522,3 +560,238 @@ def test_register_succeeds_when_email_delivery_fails(
     assert password not in caplog.text
     assert user.password not in caplog.text
     assert 'Добро пожаловать в WorkBoard!' not in caplog.text
+
+
+@pytest.mark.django_db
+def test_password_reset_confirm(user_factory, mailoutbox):
+    user = user_factory()
+    client = APIClient(enforce_csrf_checks=True)
+
+    # Получение CSRF — GET, а не POST.
+    csrf_token = client.get('/api/v1/auth/csrf/').json()['csrfToken']
+
+    # Отправляем JSON с email, а не сам объект User.
+    response = client.post(
+        '/api/v1/auth/password-reset/',
+        {'email': user.email},
+        format='json',
+        HTTP_X_CSRFTOKEN=csrf_token,
+    )
+
+    assert response.status_code == 200, response.content
+    assert len(mailoutbox) == 1
+    # Ищем строку со ссылкой в тексте письма.
+    reset_url = None
+
+    for line in mailoutbox[0].body.splitlines():
+        line = line.strip()
+
+        if line.startswith('http://') or line.startswith('https://'):
+            reset_url = line
+            break
+
+    assert reset_url is not None
+
+    # Из ссылки берём параметры, которые потом прочитает React.
+    params = parse_qs(urlsplit(reset_url).query)
+
+    uid = params['uid'][0]
+    reset_token = params['token'][0]
+
+    new_password = 'Violet!River-72-Copper'
+
+    # Имитируем отправку формы нового пароля.
+    response = client.post('/api/v1/auth/password-reset/confirm/',{
+            'uid': uid,
+            'token': reset_token,
+            'password': new_password,
+            'password_confirm': new_password,
+        }, format='json', HTTP_X_CSRFTOKEN=csrf_token,
+    )
+
+    assert response.status_code == 204, response.content
+    assert response.content == b''
+
+    # Обновляем объект из БД: пароль изменился внутри view.
+    user.refresh_from_db()
+
+    assert user.check_password(new_password)
+    assert not user.check_password('test-password')
+
+    # Сброс пароля не должен автоматически авторизовать клиента.
+    assert client.get('/api/v1/auth/me/').status_code == 403
+
+    # Теперь выполняем обычный вход с новым паролем.
+    response = client.post('/api/v1/auth/login/',{
+            'email': user.email,
+            'password': new_password,
+        }, format='json', HTTP_X_CSRFTOKEN=csrf_token,
+    )
+
+    assert response.status_code == 200, response.content
+    assert response.json()['id'] == user.pk
+
+
+@pytest.mark.django_db
+def test_password_reset_link_cannot_be_reused(user_factory, reset_request):
+    user = user_factory()
+    client, csrf_token, payload = reset_request(user)
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 204, response.content
+    user.refresh_from_db()
+    saved_password = user.password
+
+    # Та же ссылка не должна позволить установить ещё один пароль после успешного сброса.
+    payload.update(password='Another!River-81-Copper', password_confirm='Another!River-81-Copper')
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert response.json()['code'] == 'invalid_reset_link'
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+def test_password_reset_rejects_changed_token(user_factory, reset_request):
+    user = user_factory()
+    saved_password = user.password
+    client, csrf_token, payload = reset_request(user)
+    # Меняем один символ, гарантированно получая другой токен.
+    last_character = '0' if payload['token'][-1] != '0' else '1'
+    payload['token'] = payload['token'][:-1] + last_character
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert response.json()['code'] == 'invalid_reset_link'
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('uid', [
+    'A',  # Некорректная длина base64.
+    urlsafe_base64_encode(b'not-a-number'),
+    urlsafe_base64_encode(b'\xff'),  # Байты, которые нельзя декодировать как UTF-8.
+    urlsafe_base64_encode(force_bytes(999999999)),  # Несуществующий пользователь.
+    urlsafe_base64_encode(force_bytes(10 ** 100)),  # ID вне диапазона столбца БД.
+], ids=['broken_base64', 'not_numeric', 'invalid_utf8', 'unknown_user', 'oversized_id'])
+def test_password_reset_rejects_invalid_uid(user_factory, reset_request, uid):
+    user = user_factory()
+    saved_password = user.password
+    client, csrf_token, payload = reset_request(user)
+    payload['uid'] = uid
+    # Любой такой отказ должен стать JSON-ошибкой ссылки, а не необработанным исключением.
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert response.json() == {
+        'code': 'invalid_reset_link',
+        'detail': 'Ссылка недействительна или устарела. Запросите новую.',
+    }
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+def test_password_reset_rejects_expired_token(user_factory, reset_request, settings, monkeypatch):
+    user = user_factory()
+    saved_password = user.password
+    settings.PASSWORD_RESET_TIMEOUT = 1
+    created_at = default_token_generator._now()
+    monkeypatch.setattr(default_token_generator, '_now', lambda: created_at)
+    client, csrf_token, payload = reset_request(user)
+
+    # Перемещаем часы генератора за срок ссылки: реального ожидания в тесте нет.
+    monkeypatch.setattr(default_token_generator, '_now', lambda: created_at + timedelta(seconds=2))
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert response.json()['code'] == 'invalid_reset_link'
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+def test_password_reset_rejects_inactive_user(user_factory, reset_request):
+    user = user_factory()
+    saved_password = user.password
+    client, csrf_token, payload = reset_request(user)
+    # Письмо получено активным аккаунтом, но к моменту подтверждения его отключили.
+    user.is_active = False
+    user.save(update_fields=['is_active'])
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert response.json()['code'] == 'invalid_reset_link'
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('password, password_confirm, field', [
+    ('short', 'short', 'password'),
+    ('Violet!River-72-Copper', 'different-password', 'password_confirm'),
+], ids=['weak_password', 'mismatched_passwords'])
+def test_password_reset_rejects_invalid_password(
+    user_factory, reset_request, password, password_confirm, field,
+):
+    user = user_factory()
+    saved_password = user.password
+    client, csrf_token, payload = reset_request(user)
+    payload.update(password=password, password_confirm=password_confirm)
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 400
+    assert field in response.json()
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+    # Исправление полей допускает повтор с той же ссылкой: неудачная попытка её не расходует.
+    payload.update(password='Violet!River-72-Copper', password_confirm='Violet!River-72-Copper')
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 204, response.content
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('csrf_case', ['missing', 'incorrect'])
+def test_password_reset_confirm_requires_csrf(user_factory, reset_request, csrf_case):
+    user = user_factory()
+    saved_password = user.password
+    client, csrf_token, payload = reset_request(user)
+    # Cookie есть у клиента, но одного её наличия недостаточно: нужен правильный заголовок.
+    headers = {} if csrf_case == 'missing' else {'HTTP_X_CSRFTOKEN': 'A' * 64}
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', **headers)
+    assert response.status_code == 403
+    assert response.json()['code'] == 'csrf_failed'
+    user.refresh_from_db()
+    assert user.password == saved_password
+
+
+@pytest.mark.django_db
+def test_password_reset_invalidates_existing_sessions(user_factory, reset_request):
+    user = user_factory()
+    previous_clients = [APIClient(enforce_csrf_checks=True), APIClient(enforce_csrf_checks=True)]
+    for previous_client in previous_clients:
+        csrf_token = previous_client.get('/api/v1/auth/csrf/').json()['csrfToken']
+        response = previous_client.post('/api/v1/auth/login/', {
+            'email': user.email, 'password': 'test-password',
+        }, format='json', HTTP_X_CSRFTOKEN=csrf_token)
+        assert response.status_code == 200
+        assert previous_client.get('/api/v1/auth/me/').status_code == 200
+
+    # Письмо запрашиваем после входов: login меняет last_login, который участвует в токене.
+    user.refresh_from_db()
+    client, csrf_token, payload = reset_request(user)
+    response = client.post('/api/v1/auth/password-reset/confirm/', payload,
+                           format='json', HTTP_X_CSRFTOKEN=csrf_token)
+    assert response.status_code == 204, response.content
+
+    # Обе старые сессии перестают давать доступ; клиент сброса тоже не получает автоматический вход.
+    for previous_client in previous_clients:
+        response = previous_client.get('/api/v1/auth/me/')
+        assert response.status_code == 403
+        assert response.json()['code'] == 'not_authenticated'
+    assert client.get('/api/v1/auth/me/').status_code == 403

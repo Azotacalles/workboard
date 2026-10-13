@@ -81,3 +81,12 @@ export function logout() {
 export function getMe() {
     return apiRequest('/auth/me/');
 }
+
+// Обе операции восстановления — POST. apiRequest сам получает CSRF перед первым POST.
+export function requestPasswordReset(email) {
+    return apiRequest('/auth/password-reset/', { method: 'POST', data: { email } });
+}
+
+export function confirmPasswordReset(data) {
+    return apiRequest('/auth/password-reset/confirm/', { method: 'POST', data });
+}

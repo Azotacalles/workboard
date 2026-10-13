@@ -5,21 +5,24 @@ from django.middleware.csrf import get_token
 from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from django.utils.encoding import force_bytes
-from django.utils.http import urlsafe_base64_encode
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.views.csrf import csrf_failure as django_csrf_failure
 from django.views.decorators.csrf import csrf_protect
 from django.contrib.auth.tokens import default_token_generator
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import NotAuthenticated
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework import serializers
 from functools import partial
 from .emails import send_registration_email, send_password_reset_email
 from .serializers import (
     RegisterSerializer,
     UserLoginSerializer,
     UserSerializer,
-    PasswordResetSerializer
+    PasswordResetSerializer, PasswordResetConfirmSerializer
 )
 
 User = get_user_model()
@@ -142,3 +145,33 @@ class PasswordResetAPIView(AuthAPIView):
                 'Если для этого адреса доступно восстановление мы отправим письмо с инструкцией.'
             ),
         })
+
+class PasswordResetConfirmAPIView(AuthAPIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            uid = urlsafe_base64_decode(data.get('uid')).decode()
+            user = User.objects.get(pk=uid)
+        except (ValueError, TypeError, OverflowError, User.DoesNotExist) as exception:
+            return Response({
+                'code': 'invalid_reset_link',
+                'detail': 'Ссылка недействительна или устарела. Запросите новую.'
+            }, status=400)
+        if user.is_active == False or not default_token_generator.check_token(user, data.get('token')):
+            return Response({
+                'code': 'invalid_reset_link',
+                'detail': 'Ссылка недействительна или устарела. Запросите новую.'
+            }, status=400)
+        if data.get('password') != data.get('password_confirm'):
+            raise serializers.ValidationError({'password_confirm': 'Пароли не совпадают.'})
+        try:
+            validate_password(data.get('password'), user=user)
+        except DjangoValidationError as exception:
+            raise serializers.ValidationError({'password': exception.messages})
+        user.set_password(data.get('password'))
+        user.save()
+        return Response(status=204)

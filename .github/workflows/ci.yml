@@ -28,7 +28,6 @@ jobs:
           POSTGRES_USER: ci_postgres
           POSTGRES_PASSWORD: ci_postgres
           POSTGRES_DB: ci_workboard
-          FRONTEND_URL: http://localhost:5173
         ports:
           - 5432:5432
         options: >-
@@ -42,6 +41,7 @@ jobs:
       DATABASE_URL: postgres://ci_postgres:ci_postgres@localhost:5432/ci_workboard
       DJANGO_SETTINGS_MODULE: config.settings.dev
       DEBUG: "True"
+      FRONTEND_URL: http://localhost:5173
 
     steps:
       - uses: actions/checkout@v6

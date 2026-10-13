@@ -5,7 +5,7 @@ import LoginForm from './auth/LoginForm.jsx';
 import RegisterForm from './auth/RegisterForm.jsx';
 import AuthError from './auth/AuthError.jsx';
 
-function App() {
+function App({ resetCompleted = false }) {
     const [user, setUser] = useState(null);
     const [status, setStatus] = useState('loading');
     const [errorMessage, setErrorMessage] = useState('');
@@ -14,6 +14,8 @@ function App() {
     const [logoutError, setLogoutError] = useState(null);
     const [form, setForm] = useState('login');
     const [submitting, setSubmitting] = useState(false);
+    // Это временное уведомление о сбросе, а не постоянный признак страницы.
+    const [showResetNotice, setShowResetNotice] = useState(resetCompleted);
 
     useEffect(() => {
         let ignore = false;
@@ -54,6 +56,13 @@ function App() {
         setStatus('success');
         setErrorMessage('');
         setLogoutError(null);
+        setShowResetNotice(false);
+        if (resetCompleted) {
+            // После входа обновление страницы не должно возвращать уведомление о сбросе.
+            const url = new URL(window.location.href);
+            url.searchParams.delete('reset');
+            window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+        }
     }
 
     async function handleLogout() {
@@ -76,6 +85,9 @@ function App() {
     return (
         <>
             <h1>WorkBoard React</h1>
+            {showResetNotice && status === 'success' && !user && (
+                <p role="status">Пароль изменён. Для входа используйте новый пароль.</p>
+            )}
             {status === 'loading' && <p>Проверяем вход…</p>}
             {status === 'error' && (
                 <div>
@@ -87,6 +99,10 @@ function App() {
             {status === 'success' && (
                 user ? (
                     <div>
+                        {/* /me/ определяет реальную сессию, а не владельца ссылки из письма. */}
+                        {showResetNotice && (
+                            <p>Пароль изменён. Сейчас открыта сессия пользователя {user.username}. Для входа в восстановленный аккаунт завершите эту сессию.</p>
+                        )}
                         <p>Привет, {user.username}</p>
                         <AuthError
                             error={logoutError}
