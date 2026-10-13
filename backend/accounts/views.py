@@ -1,5 +1,5 @@
 from django.contrib.auth import authenticate, get_user_model, login, logout, settings
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils.cache import patch_cache_control
@@ -84,13 +84,30 @@ class RegisterAPIView(AuthAPIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        with transaction.atomic():
-            user = User.objects.create_user(
-                email=data['email'],
-                username=data['username'],
-                password=data['password'],
-            )
-            transaction.on_commit(partial(send_registration_email, user=user))
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    email=data['email'],
+                    username=data['username'],
+                    password=data['password'],
+                )
+                transaction.on_commit(partial(send_registration_email, user=user))
+        except IntegrityError as error:
+             # Исходная ошибка PostgreSQL содержит имя нарушенного ограничения.
+            constraint_name = error.__cause__.diag.constraint_name
+
+            if constraint_name in {
+                'unique_email',
+                'accounts_user_email_b2644a56_uniq',
+            }:
+                # Возвращаем такую же ошибку поля, как при проверке сериализатора.
+                raise serializers.ValidationError({
+                    'email': 'Этот email уже занят.',
+                }) from error
+
+            # Другие ошибки базы не выдаём за занятую почту.
+            raise
+
         login(request, user)
         return Response(UserSerializer(user).data, status=201)
 
@@ -153,25 +170,26 @@ class PasswordResetConfirmAPIView(AuthAPIView):
         serializer = PasswordResetConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            uid = urlsafe_base64_decode(data.get('uid')).decode()
-            user = User.objects.get(pk=uid)
-        except (ValueError, TypeError, OverflowError, User.DoesNotExist) as exception:
-            return Response({
-                'code': 'invalid_reset_link',
-                'detail': 'Ссылка недействительна или устарела. Запросите новую.'
-            }, status=400)
-        if user.is_active == False or not default_token_generator.check_token(user, data.get('token')):
-            return Response({
-                'code': 'invalid_reset_link',
-                'detail': 'Ссылка недействительна или устарела. Запросите новую.'
-            }, status=400)
-        if data.get('password') != data.get('password_confirm'):
-            raise serializers.ValidationError({'password_confirm': 'Пароли не совпадают.'})
-        try:
-            validate_password(data.get('password'), user=user)
-        except DjangoValidationError as exception:
-            raise serializers.ValidationError({'password': exception.messages})
-        user.set_password(data.get('password'))
-        user.save()
+        uid = urlsafe_base64_decode(data.get('uid')).decode()
+        with transaction.atomic():
+            try:
+                user = User.objects.select_for_update().get(pk=uid)
+            except (ValueError, TypeError, OverflowError, User.DoesNotExist) as exception:
+                return Response({
+                    'code': 'invalid_reset_link',
+                    'detail': 'Ссылка недействительна или устарела. Запросите новую.'
+                }, status=400)
+            if user.is_active == False or not default_token_generator.check_token(user, data.get('token')):
+                return Response({
+                    'code': 'invalid_reset_link',
+                    'detail': 'Ссылка недействительна или устарела. Запросите новую.'
+                }, status=400)
+            if data.get('password') != data.get('password_confirm'):
+                raise serializers.ValidationError({'password_confirm': 'Пароли не совпадают.'})
+            try:
+                validate_password(data.get('password'), user=user)
+            except DjangoValidationError as exception:
+                raise serializers.ValidationError({'password': exception.messages})
+            user.set_password(data.get('password'))
+            user.save()
         return Response(status=204)
