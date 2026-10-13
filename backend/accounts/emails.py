@@ -7,7 +7,7 @@ logging.basicConfig(filename='smtp.log', encoding='utf-8', level=logging.DEBUG)
 
 def send_registration_email(user, **kwargs):
     subject = 'Регистрация в WorkBoard'
-    from_email = 'workboard@localhost.com'
+    from_email = 'rodyginpm@gmail.com'
     to = [user.email]
     message = 'Добро пожаловать в WorkBoard!'
     try:
@@ -30,7 +30,7 @@ def send_password_reset_email(user, reset_url):
         send_mail(
             subject='Восстановление пароля WorkBoard',
             message=message,
-            from_email='workboard@localhost.com',
+            from_email='rodyginpm@gmail.com',
             recipient_list=[user.email],
         )
     except OSError:

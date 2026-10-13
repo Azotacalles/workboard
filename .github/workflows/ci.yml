@@ -42,6 +42,7 @@ jobs:
       DJANGO_SETTINGS_MODULE: config.settings.dev
       DEBUG: "True"
       FRONTEND_URL: http://localhost:5173
+      SMTP_PASSWORD: "ci-unused-password"
 
     steps:
       - uses: actions/checkout@v6
