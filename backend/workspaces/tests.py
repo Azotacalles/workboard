@@ -4,6 +4,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
+from psycopg2.extensions import JSON
 
 from .models import Workspace, Membership
 from django.test import TestCase
@@ -194,3 +195,9 @@ def test_membership_model_validation_rejects_unknown_role(user_factory):
     assert 'role' in error.value.message_dict
     assert Membership.objects.count() == 0
 
+@pytest.mark.parametrize('name', [' ', None, 'A  '])
+def test_workspace_create_serializer(name):
+    from .serializers import WorkspaceCreateSerializer
+    workspace = {'name': name}
+    data = WorkspaceCreateSerializer(workspace)
+    assert data['name'] == workspace['name']
