@@ -1,13 +1,10 @@
-"""Контракт блока 3.6: serializers и маршруты без запросов к БД."""
-
 from datetime import datetime, timezone
 
 import pytest
-from django.urls import Resolver404, resolve, reverse
 
-from .models import Workspace
-from .serializers import WorkspaceCreateSerializer, WorkspaceSerializer
-from .views import WorkspaceDetailView, WorkspaceListCreateView
+from workspaces.models import Workspace
+from workspaces.serializers import WorkspaceCreateSerializer
+from workspaces.serializers import WorkspaceSerializer
 
 
 @pytest.mark.parametrize(
@@ -72,28 +69,3 @@ def test_workspace_serializer_exposes_only_public_fields():
     assert data == {'id': 42, 'name': 'Команда', 'created_at': '2026-10-21T00:00:00Z'}
     assert WorkspaceSerializer([workspace], many=True).data == [data]
     assert WorkspaceSerializer([], many=True).data == []
-
-
-@pytest.mark.parametrize(
-    ('url', 'url_name', 'view', 'kwargs'),
-    [
-        ('/api/v1/workspaces/', 'workspaces:workspace_list', WorkspaceListCreateView, {}),
-        ('/api/v1/workspaces/42/', 'workspaces:workspace_detail', WorkspaceDetailView, {'pk': 42}),
-    ],
-)
-def test_workspace_routes(url, url_name, view, kwargs):
-    match = resolve(url)
-
-    assert match.func.view_class is view
-    assert match.kwargs == kwargs
-    assert reverse(url_name, kwargs=kwargs) == url
-
-
-@pytest.mark.parametrize('url', [
-    '/api/v1/workspaces/abc/',
-    '/api/v1/workspaces/-1/',
-    '/api/v1/workspaces/workspaces/',
-])
-def test_workspace_routes_reject_invalid_paths(url):
-    with pytest.raises(Resolver404):
-        resolve(url)

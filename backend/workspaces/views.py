@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from rest_framework import permissions, authentication, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -30,5 +31,8 @@ class WorkspaceListCreateView(APIView):
 
 
 class WorkspaceDetailView(APIView):
-    def get(self, request):
-        pass
+    def get(self, request, pk):
+        qs = Workspace.objects.filter(memberships__user=request.user)
+        workspace = get_object_or_404(qs, pk=pk)
+        serializer = WorkspaceSerializer(workspace)
+        return Response(serializer.data, status=status.HTTP_200_OK)

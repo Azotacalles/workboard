@@ -234,14 +234,22 @@ docker compose exec frontend npm run lint
 docker compose exec frontend npm run build
 ```
 
-Тесты проверяют User/manager, регистрацию, вход, выход, независимые и истёкшие сессии, CSRF/Origin, письма, восстановление и ошибки без побочных изменений. В `backend/accounts/tests.py` есть комментарии к сценариям. Health endpoint проверяется отдельно.
+Тесты сгруппированы по назначению в пакетах `tests/` внутри приложений:
+
+- `backend/accounts/tests/`: модели, auth и сессии, регистрация, восстановление пароля, безопасность, письма и Admin.
+- `backend/workspaces/tests/`: модели, serializers, маршруты, создание, список и detail API.
+- `backend/tasks/tests/test_health.py`: health endpoint.
+- `backend/projects/tests/`: пакет для будущих тестов проектов, пока без сценариев.
+
+Общие `user_factory` и `logged_in_client` находятся в `backend/conftest.py`. Подготовка письма восстановления — в `accounts/tests/conftest.py`, данные workspace — в `workspaces/tests/conftest.py`. В тестах сохранены комментарии к сценариям.
 
 pytest-django создаёт отдельную PostgreSQL-БД и применяет к ней миграции; тестовые письма наружу не отправляются. Успешные тесты не означают, что миграции применены к основной development-БД. Пользователю PostgreSQL требуется право создавать тестовые базы. `makemigrations --check --dry-run` проверяет описание моделей, но не применяет миграции.
 
 Для отдельного сценария:
 
 ```bash
-docker compose exec -w /app/backend backend python -m pytest accounts/tests.py::test_user_logout -v
+docker compose exec -w /app/backend backend python -m pytest accounts/tests/test_auth.py::test_user_logout -v
+docker compose exec -w /app/backend backend python -m pytest workspaces/tests/test_api_detail.py -v
 docker compose exec -w /app/backend backend python -m pytest -k password_reset -v
 ```
 
