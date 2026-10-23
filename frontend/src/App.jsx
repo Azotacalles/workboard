@@ -4,6 +4,7 @@ import { getMe, logout } from './api/client.js';
 import LoginForm from './auth/LoginForm.jsx';
 import RegisterForm from './auth/RegisterForm.jsx';
 import AuthError from './auth/AuthError.jsx';
+import WorkspaceHome from './workspaces/WorkspaceHome.jsx';
 
 function App({ resetCompleted = false }) {
     const [user, setUser] = useState(null);
@@ -113,6 +114,11 @@ function App({ resetCompleted = false }) {
                         <button type="button" onClick={handleLogout} disabled={loggingOut}>
                             {loggingOut ? 'Подождите…' : 'Выйти'}
                         </button>
+                        <WorkspaceHome key={user.id}
+                                       user={user}
+                                       onCheckSession={handleRetry}
+                                       onPendingChange={setSubmitting}
+                                       busy={submitting || loggingOut} />
                     </div>
                 ) : (
                     <div>
